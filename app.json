@@ -1,0 +1,17 @@
+{
+  "expo": {
+    "name": "ConKey",
+    "slug": "conkey",
+    "version": "1.0.0",
+    "extra": {
+      "eas": {
+        "projectId": "c28918b6-e120-4180-ac1d-788cef12ad94"
+      }
+    },
+    "android": {
+      "package": "com.conkey",
+      "versionCode": 1,
+      "minSdkVersion": 28
+    }
+  }
+}
