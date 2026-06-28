@@ -160,6 +160,9 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     @Volatile private var appRegistered = false
     // A device the user asked to connect to before registration completed.
     @Volatile private var pendingConnect: BluetoothDevice? = null
+    // Explicit stop flag — more reliable than Thread.isInterrupted() because
+    // Thread.sleep() inside flow-control helpers clears the interrupt flag.
+    @Volatile private var stopTyping = false
     // Deterministic RNG seeded lazily; varied per-character for human-like cadence.
     private var rngState: Long = 0x2545F4914F6CDD1DL
 
@@ -482,13 +485,18 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     ) {
         var attempt = 0
         while (attempt < 8) {
+            if (stopTyping) return
             if (hid.sendReport(device, 0, report)) return
-            // Buffer full — back off with a small, growing delay before retrying.
-            Thread.sleep(5L + attempt * 3L)
+            try {
+                Thread.sleep(5L + attempt * 3L)
+            } catch (e: InterruptedException) {
+                // Restore the interrupt flag so the outer loop sees it,
+                // then bail — this is what was swallowing the stop signal.
+                Thread.currentThread().interrupt()
+                return
+            }
             attempt++
         }
-        // After repeated failures, one last try; if it still fails the caller's
-        // connection-state listener will surface the real disconnect.
         hid.sendReport(device, 0, report)
     }
 
@@ -524,13 +532,14 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             promise.reject("NOT_CONNECTED", "No device connected")
             return
         }
+        stopTyping = false
         autoTypeThread?.interrupt()
         autoTypeThread = Thread {
             try {
                 val factor = randomness.coerceIn(0.0, 1.0)
                 var sent = 0
                 for (char in text) {
-                    if (Thread.currentThread().isInterrupted) break
+                    if (stopTyping || Thread.currentThread().isInterrupted) break
                     // Stop only if the host is genuinely gone — check the live
                     // connected list, not just the cache (which can be transiently
                     // null while the link is still up).
@@ -587,16 +596,21 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
         return Math.round(value * 100000.0) / 100000.0
     }
 
-    /** Sleeps for [ms] milliseconds with nanosecond precision (Thread.sleep(ms, ns)). */
+    /** Sleeps for [ms] milliseconds with nanosecond precision. Propagates interrupts. */
     private fun sleepPrecise(ms: Double) {
         if (ms <= 0.0) return
         val whole = ms.toLong()
         val nanos = ((ms - whole) * 1_000_000.0).toInt().coerceIn(0, 999_999)
-        Thread.sleep(whole, nanos)
+        try {
+            Thread.sleep(whole, nanos)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     @ReactMethod
     fun stopAutoType(promise: Promise) {
+        stopTyping = true
         autoTypeThread?.interrupt()
         promise.resolve(true)
     }
