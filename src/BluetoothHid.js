@@ -24,7 +24,9 @@ export default {
   connectDevice: (address) => BluetoothHid?.connectDevice(address),
   disconnectDevice: () => BluetoothHid?.disconnectDevice(),
   sendKey: (modifier, keyCode) => BluetoothHid?.sendKey(modifier, keyCode),
-  sendText: (text, delayMs) => BluetoothHid?.sendText(text, delayMs),
+  // delayMs supports up to 5 decimals; randomness 0..1 adds human-like jitter.
+  sendText: (text, delayMs, randomness = 0) =>
+    BluetoothHid?.sendText(text, delayMs, randomness),
   stopAutoType: () => BluetoothHid?.stopAutoType(),
 
   addListener: (event, callback) => emitter?.addListener(event, callback),

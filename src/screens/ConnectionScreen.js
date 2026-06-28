@@ -14,10 +14,14 @@ export default function ConnectionScreen({ navigation }) {
   const [pairedDevices, setPairedDevices] = useState([]);
   const [connectingAddress, setConnectingAddress] = useState(null);
   const listeners = useRef([]);
+  const connectTimeout = useRef(null);
 
   useEffect(() => {
     setup();
-    return () => listeners.current.forEach(l => l?.remove());
+    return () => {
+      listeners.current.forEach(l => l?.remove());
+      if (connectTimeout.current) clearTimeout(connectTimeout.current);
+    };
   }, []);
 
   async function setup() {
@@ -40,9 +44,15 @@ export default function ConnectionScreen({ navigation }) {
     );
     listeners.current.push(
       BluetoothHid.addListener('onConnectionStateChanged', ({ address, name, state }) => {
-        setConnectingAddress(null);
         if (state === BT_STATES.CONNECTED) {
+          if (connectTimeout.current) clearTimeout(connectTimeout.current);
+          setConnectingAddress(null);
           navigation.navigate('Keyboard', { deviceName: name, deviceAddress: address });
+        } else if (state === BT_STATES.DISCONNECTED) {
+          // Only clear the spinner on an explicit disconnect; transient
+          // connecting states shouldn't cancel the in-flight attempt.
+          if (connectTimeout.current) clearTimeout(connectTimeout.current);
+          setConnectingAddress(null);
         }
       })
     );
@@ -78,10 +88,33 @@ export default function ConnectionScreen({ navigation }) {
 
   async function connect(address, name) {
     setConnectingAddress(address);
-    const ok = await BluetoothHid.connectDevice(address);
-    if (!ok) {
+    // Clear any previous timeout, then arm a fresh one.
+    if (connectTimeout.current) clearTimeout(connectTimeout.current);
+    connectTimeout.current = setTimeout(() => {
+      setConnectingAddress(prev => {
+        if (prev === address) {
+          Alert.alert(
+            'Connection Timed Out',
+            `Could not connect to ${name}. Make sure the device is in range and accepts a keyboard.`
+          );
+          return null;
+        }
+        return prev;
+      });
+    }, 25000);
+
+    try {
+      const started = await BluetoothHid.connectDevice(address);
+      if (!started) {
+        clearTimeout(connectTimeout.current);
+        setConnectingAddress(null);
+        Alert.alert('Connection Failed', `Could not start connection to ${name}`);
+      }
+      // Success is confirmed asynchronously via onConnectionStateChanged.
+    } catch (e) {
+      clearTimeout(connectTimeout.current);
       setConnectingAddress(null);
-      Alert.alert('Connection Failed', `Could not connect to ${name}`);
+      Alert.alert('Connection Error', e.message);
     }
   }
 

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity,
   StyleSheet, ScrollView, Alert,
@@ -13,12 +13,53 @@ const DELAY_PRESETS = [
   { label: 'Very Slow', value: 300 },
 ];
 
+const RANDOM_PRESETS = [
+  { label: 'Off', value: 0 },
+  { label: 'Light', value: 0.25 },
+  { label: 'Human', value: 0.5 },
+  { label: 'Wild', value: 0.9 },
+];
+
 export default function AutoTypeScreen({ route, navigation }) {
   const { deviceName } = route.params || {};
   const [text, setText] = useState('');
   const [delayMs, setDelayMs] = useState(50);
+  // Separate raw text so users can type partial values like "49." without snapping.
+  const [delayText, setDelayText] = useState('50');
+  const [randomness, setRandomness] = useState(0.5);
   const [typing, setTyping] = useState(false);
   const [progress, setProgress] = useState('');
+  const progressListener = useRef(null);
+
+  function onDelayTextChange(raw) {
+    // Keep only digits and a single decimal point, max 5 decimal places.
+    let cleaned = raw.replace(/[^0-9.]/g, '');
+    const firstDot = cleaned.indexOf('.');
+    if (firstDot !== -1) {
+      const intPart = cleaned.slice(0, firstDot);
+      let decPart = cleaned.slice(firstDot + 1).replace(/\./g, '').slice(0, 5);
+      cleaned = `${intPart}.${decPart}`;
+    }
+    setDelayText(cleaned);
+    const parsed = parseFloat(cleaned);
+    if (!isNaN(parsed)) setDelayMs(parsed);
+  }
+
+  // Keep the custom-delay text in sync when a preset button is tapped.
+  function selectDelayPreset(value) {
+    setDelayMs(value);
+    setDelayText(String(value));
+  }
+
+  useEffect(() => {
+    progressListener.current = BluetoothHid.addListener(
+      'onAutoTypeProgress',
+      ({ sent, total }) => {
+        if (sent < total) setProgress(`Typing… ${sent}/${total}`);
+      }
+    );
+    return () => progressListener.current?.remove();
+  }, []);
 
   async function startAutoType() {
     if (!text.trim()) {
@@ -28,7 +69,7 @@ export default function AutoTypeScreen({ route, navigation }) {
     setTyping(true);
     setProgress(`Sending ${text.length} characters…`);
     try {
-      const ok = await BluetoothHid.sendText(text, delayMs);
+      const ok = await BluetoothHid.sendText(text, delayMs, randomness);
       setProgress(ok ? 'Done!' : 'Stopped.');
     } catch (e) {
       setProgress('Error: ' + e.message);
@@ -72,7 +113,7 @@ export default function AutoTypeScreen({ route, navigation }) {
             <TouchableOpacity
               key={preset.value}
               style={[styles.preset, delayMs === preset.value && styles.presetActive]}
-              onPress={() => setDelayMs(preset.value)}
+              onPress={() => selectDelayPreset(preset.value)}
             >
               <Text style={[styles.presetLabel, delayMs === preset.value && styles.presetLabelActive]}>
                 {preset.label}
@@ -88,11 +129,32 @@ export default function AutoTypeScreen({ route, navigation }) {
           <Text style={styles.customDelayLabel}>Custom delay (ms):</Text>
           <TextInput
             style={styles.customDelayInput}
-            value={String(delayMs)}
-            onChangeText={v => setDelayMs(Number(v) || 0)}
-            keyboardType="number-pad"
+            value={delayText}
+            onChangeText={onDelayTextChange}
+            keyboardType="decimal-pad"
             editable={!typing}
+            placeholder="50.00000"
+            placeholderTextColor="#555"
           />
+        </View>
+        <Text style={styles.hint}>Up to 5 decimals (e.g. 49.37512 ms)</Text>
+
+        <Text style={styles.label}>Randomness</Text>
+        <View style={styles.presets}>
+          {RANDOM_PRESETS.map(preset => (
+            <TouchableOpacity
+              key={preset.value}
+              style={[styles.preset, randomness === preset.value && styles.presetActive]}
+              onPress={() => setRandomness(preset.value)}
+            >
+              <Text style={[styles.presetLabel, randomness === preset.value && styles.presetLabelActive]}>
+                {preset.label}
+              </Text>
+              <Text style={[styles.presetSub, randomness === preset.value && styles.presetLabelActive]}>
+                ±{Math.round(preset.value * 100)}%
+              </Text>
+            </TouchableOpacity>
+          ))}
         </View>
 
         {progress ? (
@@ -158,9 +220,10 @@ const styles = StyleSheet.create({
     borderRadius: 10, padding: 12,
   },
   customDelayLabel: { color: '#aaa', flex: 1 },
+  hint: { color: '#555', fontSize: 11, marginTop: 6 },
   customDelayInput: {
     color: '#fff', borderBottomWidth: 1, borderBottomColor: '#6C63FF',
-    textAlign: 'center', width: 70, fontSize: 16,
+    textAlign: 'center', width: 110, fontSize: 16,
   },
   progressBanner: {
     marginTop: 16, backgroundColor: '#1e3a1e', borderRadius: 8, padding: 12,

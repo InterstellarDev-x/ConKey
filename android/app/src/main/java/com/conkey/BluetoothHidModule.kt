@@ -155,12 +155,27 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     private val executor = Executors.newSingleThreadExecutor()
     private var autoTypeThread: Thread? = null
 
+    // True once the HID app has finished registering with the BT stack.
+    @Volatile private var appRegistered = false
+    // A device the user asked to connect to before registration completed.
+    @Volatile private var pendingConnect: BluetoothDevice? = null
+    // Deterministic RNG seeded lazily; varied per-character for human-like cadence.
+    private var rngState: Long = 0x2545F4914F6CDD1DL
+
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
+            appRegistered = registered
             sendEvent("onHidAppStatus", Arguments.createMap().apply {
                 putBoolean("registered", registered)
                 putString("device", pluggedDevice?.address)
             })
+            // If the user tapped a device before registration finished, connect now.
+            if (registered) {
+                pendingConnect?.let { device ->
+                    pendingConnect = null
+                    hidDevice?.connect(device)
+                }
+            }
         }
 
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
@@ -234,6 +249,26 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
                     sendEvent("onScanFinished", Arguments.createMap())
                 }
+                BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                    val bondState = intent.getIntExtra(
+                        BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE
+                    )
+                    if (bondState == BluetoothDevice.BOND_BONDED) {
+                        // Pairing finished — connect now if this is the device we wanted,
+                        // and the HID app is ready (otherwise onAppStatusChanged handles it).
+                        val pending = pendingConnect
+                        if (pending != null && appRegistered && hidDevice != null) {
+                            pendingConnect = null
+                            hidDevice?.connect(pending)
+                        }
+                    } else if (bondState == BluetoothDevice.BOND_NONE) {
+                        sendEvent("onConnectionStateChanged", Arguments.createMap().apply {
+                            putString("address", "")
+                            putString("name", "")
+                            putInt("state", BluetoothProfile.STATE_DISCONNECTED)
+                        })
+                    }
+                }
             }
         }
     }
@@ -250,6 +285,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             val filter = IntentFilter().apply {
                 addAction(BluetoothDevice.ACTION_FOUND)
                 addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
             }
             reactApplicationContext.registerReceiver(discoveryReceiver, filter)
             bluetoothAdapter.getProfileProxy(
@@ -309,6 +345,26 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                 promise.reject("DEVICE_NOT_FOUND", "Device not found: $address")
                 return
             }
+
+            // Stop discovery first — scanning starves the connection attempt.
+            bluetoothAdapter.cancelDiscovery()
+
+            // Must be bonded (paired) before a HID connection can be established.
+            // createBond() is async; the actual connect happens once bonded + registered.
+            if (device.bondState != BluetoothDevice.BOND_BONDED) {
+                pendingConnect = device
+                val started = device.createBond()
+                promise.resolve(started)
+                return
+            }
+
+            // If the HID app isn't registered yet, defer the connect.
+            if (!appRegistered || hidDevice == null) {
+                pendingConnect = device
+                promise.resolve(true)
+                return
+            }
+
             val result = hidDevice?.connect(device) ?: false
             promise.resolve(result)
         } catch (e: Exception) {
@@ -334,24 +390,74 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             promise.reject("NOT_CONNECTED", "No device connected")
             return
         }
-        try {
-            // Key press
-            val pressReport = byteArrayOf(
-                modifier.toByte(), 0x00,
-                keyCode.toByte(), 0x00, 0x00, 0x00, 0x00, 0x00
-            )
-            hid.sendReport(device, 0, pressReport)
-            // Key release
-            val releaseReport = ByteArray(8)
-            hid.sendReport(device, 0, releaseReport)
-            promise.resolve(true)
-        } catch (e: Exception) {
-            promise.reject("SEND_ERROR", e.message)
+        // Run off the JS thread so the hold-time sleep doesn't block the bridge.
+        executor.execute {
+            try {
+                pressAndRelease(hid, device, modifier.toByte(), keyCode.toByte())
+                promise.resolve(true)
+            } catch (e: Exception) {
+                promise.reject("SEND_ERROR", e.message)
+            }
         }
     }
 
+    /**
+     * Sends a single keystroke as a proper press → hold → release cycle.
+     *
+     * The host registers a key on the press report and stops on the release
+     * (all-zero) report. If the release arrives too quickly the host may either
+     * miss the press or trigger key auto-repeat, causing one tap to type twice.
+     * A short, guaranteed hold (and a guaranteed release in finally) fixes that.
+     */
+    private fun pressAndRelease(
+        hid: BluetoothHidDevice,
+        device: BluetoothDevice,
+        modifier: Byte,
+        keyCode: Byte
+    ) {
+        val pressReport = byteArrayOf(
+            modifier, 0x00, keyCode, 0x00, 0x00, 0x00, 0x00, 0x00
+        )
+        try {
+            hid.sendReport(device, 0, pressReport)
+            // Hold long enough for the host to register exactly one key-down.
+            Thread.sleep(12)
+        } finally {
+            // Always release, even if the hold was interrupted, so the key
+            // never sticks down (which would auto-repeat forever).
+            hid.sendReport(device, 0, EMPTY_REPORT)
+        }
+    }
+
+    // Reusable all-zero release report.
+    private val EMPTY_REPORT = ByteArray(8)
+
+    /** xorshift64 RNG — avoids java.util.Random's allocation in the type loop. */
+    private fun nextRandomFraction(): Double {
+        // Lazily seed from the system clock so cadence differs each run.
+        if (rngState == 0x2545F4914F6CDD1DL) {
+            rngState = System.nanoTime() xor 0x2545F4914F6CDD1DL
+        }
+        var x = rngState
+        x = x xor (x shl 13)
+        x = x xor (x ushr 7)
+        x = x xor (x shl 17)
+        rngState = x
+        // Map to [0, 1).
+        return ((x ushr 11).toDouble()) / (1L shl 53).toDouble()
+    }
+
+    /**
+     * Auto-types [text] keystroke-by-keystroke.
+     *
+     * @param delayMs       base inter-key delay in milliseconds, kept to 5-decimal
+     *                      precision (e.g. 49.37512). Sub-millisecond fractions are
+     *                      applied via nanosecond-precision sleeps.
+     * @param randomness    0.0 = constant delay; 1.0 = each delay varies up to ±100%
+     *                      of the base, giving a human-like irregular cadence.
+     */
     @ReactMethod
-    fun sendText(text: String, delayMs: Int, promise: Promise) {
+    fun sendText(text: String, delayMs: Double, randomness: Double, promise: Promise) {
         val device = connectedDevice
         val hid = hidDevice
         if (device == null || hid == null) {
@@ -361,21 +467,36 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
         autoTypeThread?.interrupt()
         autoTypeThread = Thread {
             try {
+                val factor = randomness.coerceIn(0.0, 1.0)
+                var sent = 0
                 for (char in text) {
                     if (Thread.currentThread().isInterrupted) break
-                    val mapping = ASCII_TO_KEYCODE[char]
-                    if (mapping != null) {
-                        val (modifier, keyCode) = mapping
-                        val pressReport = byteArrayOf(
-                            modifier, 0x00,
-                            keyCode, 0x00, 0x00, 0x00, 0x00, 0x00
-                        )
-                        hid.sendReport(device, 0, pressReport)
-                        Thread.sleep(20)
-                        hid.sendReport(device, 0, ByteArray(8))
-                        if (delayMs > 0) Thread.sleep(delayMs.toLong())
+                    val mapping = ASCII_TO_KEYCODE[char] ?: continue
+                    val (modifier, keyCode) = mapping
+                    pressAndRelease(hid, device, modifier, keyCode)
+                    sent++
+
+                    // Compute this character's delay with optional randomness.
+                    // Round to 5 decimals so the configured precision is honored.
+                    val jitter = if (factor > 0.0) {
+                        // Symmetric variation in [-factor, +factor].
+                        1.0 + (nextRandomFraction() * 2.0 - 1.0) * factor
+                    } else 1.0
+                    val effectiveMs = roundTo5(delayMs * jitter).coerceAtLeast(0.0)
+                    sleepPrecise(effectiveMs)
+
+                    // Periodic progress so the UI can show a live count.
+                    if (sent % 8 == 0) {
+                        sendEvent("onAutoTypeProgress", Arguments.createMap().apply {
+                            putInt("sent", sent)
+                            putInt("total", text.length)
+                        })
                     }
                 }
+                sendEvent("onAutoTypeProgress", Arguments.createMap().apply {
+                    putInt("sent", sent)
+                    putInt("total", text.length)
+                })
                 promise.resolve(true)
             } catch (e: InterruptedException) {
                 promise.resolve(false)
@@ -384,6 +505,19 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             }
         }
         autoTypeThread!!.start()
+    }
+
+    /** Rounds a millisecond value to 5 decimal places (0.00001 ms resolution). */
+    private fun roundTo5(value: Double): Double {
+        return Math.round(value * 100000.0) / 100000.0
+    }
+
+    /** Sleeps for [ms] milliseconds with nanosecond precision (Thread.sleep(ms, ns)). */
+    private fun sleepPrecise(ms: Double) {
+        if (ms <= 0.0) return
+        val whole = ms.toLong()
+        val nanos = ((ms - whole) * 1_000_000.0).toInt().coerceIn(0, 999_999)
+        Thread.sleep(whole, nanos)
     }
 
     @ReactMethod
