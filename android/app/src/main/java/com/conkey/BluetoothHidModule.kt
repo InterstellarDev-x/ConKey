@@ -4,6 +4,7 @@ import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothHidDevice
 import android.bluetooth.BluetoothHidDeviceAppSdpSettings
+import android.bluetooth.BluetoothHidDeviceAppQosSettings
 import android.bluetooth.BluetoothProfile
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -211,7 +212,17 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                     BluetoothHidDevice.SUBCLASS1_KEYBOARD,
                     KEYBOARD_DESCRIPTOR
                 )
-                hidDevice?.registerApp(sdpSettings, null, null, executor, hidCallback)
+                // Best-effort QoS makes the stack tolerant of report bursts
+                // instead of dropping the link when the buffer briefly fills.
+                val qos = BluetoothHidDeviceAppQosSettings(
+                    BluetoothHidDeviceAppQosSettings.SERVICE_BEST_EFFORT,
+                    800,   // token rate
+                    9,     // token bucket size
+                    0,     // peak bandwidth
+                    11250, // latency (µs)
+                    BluetoothHidDeviceAppQosSettings.MAX
+                )
+                hidDevice?.registerApp(sdpSettings, null, qos, executor, hidCallback)
                 sendEvent("onHidReady", Arguments.createMap().apply {
                     putBoolean("ready", true)
                 })
@@ -274,6 +285,24 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     }
 
     override fun getName() = NAME
+
+    /**
+     * Returns the device we can actually send to right now.
+     *
+     * The cached [connectedDevice] can go stale: a transient STATE_DISCONNECTED
+     * nulls it, but the host often stays connected (or silently reconnects) at
+     * the HID level without a fresh STATE_CONNECTED arriving. So we fall back to
+     * the authoritative source — hidDevice.getConnectedDevices() — and re-cache
+     * whatever it reports. This is why "no device connected" used to appear even
+     * though the link was alive and reopening the app fixed it.
+     */
+    private fun resolveConnectedDevice(): BluetoothDevice? {
+        val cached = connectedDevice
+        if (cached != null) return cached
+        val live = hidDevice?.connectedDevices?.firstOrNull()
+        if (live != null) connectedDevice = live
+        return live
+    }
 
     @ReactMethod
     fun initialize(promise: Promise) {
@@ -373,6 +402,11 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun isConnected(promise: Promise) {
+        promise.resolve(resolveConnectedDevice() != null)
+    }
+
+    @ReactMethod
     fun disconnectDevice(promise: Promise) {
         try {
             connectedDevice?.let { hidDevice?.disconnect(it) }
@@ -384,7 +418,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun sendKey(modifier: Int, keyCode: Int, promise: Promise) {
-        val device = connectedDevice
+        val device = resolveConnectedDevice()
         val hid = hidDevice
         if (device == null || hid == null) {
             promise.reject("NOT_CONNECTED", "No device connected")
@@ -419,18 +453,44 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             modifier, 0x00, keyCode, 0x00, 0x00, 0x00, 0x00, 0x00
         )
         try {
-            hid.sendReport(device, 0, pressReport)
+            sendReportFlowControlled(hid, device, pressReport)
             // Hold long enough for the host to register exactly one key-down.
             Thread.sleep(12)
         } finally {
             // Always release, even if the hold was interrupted, so the key
             // never sticks down (which would auto-repeat forever).
-            hid.sendReport(device, 0, EMPTY_REPORT)
+            sendReportFlowControlled(hid, device, EMPTY_REPORT)
         }
     }
 
     // Reusable all-zero release report.
     private val EMPTY_REPORT = ByteArray(8)
+
+    /**
+     * Sends a HID report with simple flow control.
+     *
+     * sendReport() returns false when the radio's outgoing buffer is full.
+     * Ignoring that and pushing more reports overflows the L2CAP channel, and
+     * the Bluetooth stack then drops the whole connection to recover — which is
+     * what caused the "auto-disconnect while typing" bug. Instead we back off
+     * and retry a few times, giving the buffer time to drain.
+     */
+    private fun sendReportFlowControlled(
+        hid: BluetoothHidDevice,
+        device: BluetoothDevice,
+        report: ByteArray
+    ) {
+        var attempt = 0
+        while (attempt < 8) {
+            if (hid.sendReport(device, 0, report)) return
+            // Buffer full — back off with a small, growing delay before retrying.
+            Thread.sleep(5L + attempt * 3L)
+            attempt++
+        }
+        // After repeated failures, one last try; if it still fails the caller's
+        // connection-state listener will surface the real disconnect.
+        hid.sendReport(device, 0, report)
+    }
 
     /** xorshift64 RNG — avoids java.util.Random's allocation in the type loop. */
     private fun nextRandomFraction(): Double {
@@ -458,7 +518,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
      */
     @ReactMethod
     fun sendText(text: String, delayMs: Double, randomness: Double, promise: Promise) {
-        val device = connectedDevice
+        val device = resolveConnectedDevice()
         val hid = hidDevice
         if (device == null || hid == null) {
             promise.reject("NOT_CONNECTED", "No device connected")
@@ -471,6 +531,19 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                 var sent = 0
                 for (char in text) {
                     if (Thread.currentThread().isInterrupted) break
+                    // Stop only if the host is genuinely gone — check the live
+                    // connected list, not just the cache (which can be transiently
+                    // null while the link is still up).
+                    val stillConnected = connectedDevice?.address == device.address ||
+                        hid.connectedDevices.any { it.address == device.address }
+                    if (!stillConnected) {
+                        sendEvent("onAutoTypeProgress", Arguments.createMap().apply {
+                            putInt("sent", sent)
+                            putInt("total", text.length)
+                        })
+                        promise.resolve(false)
+                        return@Thread
+                    }
                     val mapping = ASCII_TO_KEYCODE[char] ?: continue
                     val (modifier, keyCode) = mapping
                     pressAndRelease(hid, device, modifier, keyCode)
@@ -482,7 +555,9 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                         // Symmetric variation in [-factor, +factor].
                         1.0 + (nextRandomFraction() * 2.0 - 1.0) * factor
                     } else 1.0
-                    val effectiveMs = roundTo5(delayMs * jitter).coerceAtLeast(0.0)
+                    // Floor at 5 ms between characters: faster than this and the
+                    // radio buffer can't drain, which drops the connection.
+                    val effectiveMs = roundTo5(delayMs * jitter).coerceAtLeast(5.0)
                     sleepPrecise(effectiveMs)
 
                     // Periodic progress so the UI can show a live count.
