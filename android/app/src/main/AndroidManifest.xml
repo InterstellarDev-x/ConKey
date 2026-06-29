@@ -4,12 +4,19 @@
   <uses-permission android:name="android.permission.INTERNET"/>
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
+  <uses-permission android:name="android.permission.WAKE_LOCK"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
   <!-- Bluetooth HID permissions -->
   <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30"/>
   <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30"/>
   <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
-  <uses-permission android:name="android.permission.BLUETOOTH_SCAN"/>
+  <!-- neverForLocation: we use BT scan for HID pairing, not location -->
+  <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+      android:usesPermissionFlags="neverForLocation"
+      tools:targetApi="s"/>
   <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
 
   <uses-feature android:name="android.hardware.bluetooth" android:required="true"/>
@@ -30,5 +37,9 @@
         <category android:name="android.intent.category.LAUNCHER"/>
       </intent-filter>
     </activity>
+    <service
+      android:name=".BluetoothHidService"
+      android:foregroundServiceType="connectedDevice"
+      android:exported="false"/>
   </application>
 </manifest>

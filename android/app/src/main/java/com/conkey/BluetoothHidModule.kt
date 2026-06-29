@@ -11,6 +11,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.PowerManager
 import com.facebook.react.bridge.*
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.util.concurrent.Executors
@@ -166,6 +167,11 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     // Deterministic RNG seeded lazily; varied per-character for human-like cadence.
     private var rngState: Long = 0x2545F4914F6CDD1DL
 
+    // Prevents CPU from sleeping while auto-type is running in the background.
+    private var wakeLock: PowerManager.WakeLock? = null
+    // Guard against registering the discoveryReceiver more than once.
+    private var receiverRegistered = false
+
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
             appRegistered = registered
@@ -185,8 +191,10 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
         override fun onConnectionStateChanged(device: BluetoothDevice, state: Int) {
             if (state == BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device
+                startForegroundService("Connected to ${device.name ?: device.address}")
             } else if (state == BluetoothProfile.STATE_DISCONNECTED) {
                 if (connectedDevice?.address == device.address) connectedDevice = null
+                stopForegroundService()
             }
             sendEvent("onConnectionStateChanged", Arguments.createMap().apply {
                 putString("address", device.address)
@@ -208,6 +216,14 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
         override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
             if (profile == BluetoothProfile.HID_DEVICE) {
                 hidDevice = proxy as BluetoothHidDevice
+                // Don't re-register if the app is already registered with the
+                // stack — registerApp() twice fails / duplicates the SDP record.
+                if (appRegistered) {
+                    sendEvent("onHidReady", Arguments.createMap().apply {
+                        putBoolean("ready", true)
+                    })
+                    return
+                }
                 val sdpSettings = BluetoothHidDeviceAppSdpSettings(
                     "ConKey",
                     "Bluetooth Keyboard",
@@ -264,6 +280,12 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                     sendEvent("onScanFinished", Arguments.createMap())
                 }
                 BluetoothDevice.ACTION_BOND_STATE_CHANGED -> {
+                    val bondDevice = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                    }
                     val bondState = intent.getIntExtra(
                         BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.BOND_NONE
                     )
@@ -276,11 +298,18 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                             hidDevice?.connect(pending)
                         }
                     } else if (bondState == BluetoothDevice.BOND_NONE) {
-                        sendEvent("onConnectionStateChanged", Arguments.createMap().apply {
-                            putString("address", "")
-                            putString("name", "")
-                            putInt("state", BluetoothProfile.STATE_DISCONNECTED)
-                        })
+                        // Only treat this as a disconnect if it's the device we're
+                        // actually connected to — unpairing some *other* device must
+                        // not eject the user from an active keyboard session.
+                        if (bondDevice != null && connectedDevice?.address == bondDevice.address) {
+                            connectedDevice = null
+                            stopForegroundService()
+                            sendEvent("onConnectionStateChanged", Arguments.createMap().apply {
+                                putString("address", bondDevice.address)
+                                putString("name", bondDevice.name ?: "Unknown")
+                                putInt("state", BluetoothProfile.STATE_DISCONNECTED)
+                            })
+                        }
                     }
                 }
             }
@@ -314,12 +343,26 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             return
         }
         try {
-            val filter = IntentFilter().apply {
-                addAction(BluetoothDevice.ACTION_FOUND)
-                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
-                addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+            if (!receiverRegistered) {
+                val filter = IntentFilter().apply {
+                    addAction(BluetoothDevice.ACTION_FOUND)
+                    addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+                    addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED)
+                }
+                reactApplicationContext.registerReceiver(discoveryReceiver, filter)
+                receiverRegistered = true
             }
-            reactApplicationContext.registerReceiver(discoveryReceiver, filter)
+            // If the proxy is already up (screen remounted, e.g. user navigated
+            // back), don't fetch a new one — that re-runs onServiceConnected and
+            // double-registers the HID app, which the stack rejects. Just
+            // re-emit current readiness so the UI's status dot is correct.
+            if (hidDevice != null) {
+                sendEvent("onHidReady", Arguments.createMap().apply {
+                    putBoolean("ready", true)
+                })
+                promise.resolve(true)
+                return
+            }
             bluetoothAdapter.getProfileProxy(
                 reactApplicationContext,
                 profileListener,
@@ -339,7 +382,16 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     @ReactMethod
     fun startScan(promise: Promise) {
         try {
-            bluetoothAdapter?.startDiscovery()
+            val adapter = bluetoothAdapter
+            if (adapter == null || !adapter.isEnabled) {
+                promise.reject("SCAN_ERROR", "Bluetooth is not enabled")
+                return
+            }
+            val started = adapter.startDiscovery()
+            if (!started) {
+                promise.reject("SCAN_ERROR", "startDiscovery() returned false — check permissions or that another scan is not already running")
+                return
+            }
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("SCAN_ERROR", e.message)
@@ -535,6 +587,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
         stopTyping = false
         autoTypeThread?.interrupt()
         autoTypeThread = Thread {
+            acquireWakeLock()
             try {
                 val factor = randomness.coerceIn(0.0, 1.0)
                 var sent = 0
@@ -575,17 +628,21 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                             putInt("sent", sent)
                             putInt("total", text.length)
                         })
+                        updateForegroundNotification("Typing… $sent/${text.length}")
                     }
                 }
                 sendEvent("onAutoTypeProgress", Arguments.createMap().apply {
                     putInt("sent", sent)
                     putInt("total", text.length)
                 })
+                updateForegroundNotification("Connected to ${device.name ?: device.address}")
                 promise.resolve(true)
             } catch (e: InterruptedException) {
                 promise.resolve(false)
             } catch (e: Exception) {
                 promise.reject("SEND_TEXT_ERROR", e.message)
+            } finally {
+                releaseWakeLock()
             }
         }
         autoTypeThread!!.start()
@@ -627,10 +684,67 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             .emit(eventName, params)
     }
 
-    override fun invalidate() {
+    private fun startForegroundService(status: String) {
+        val ctx = reactApplicationContext
+        val intent = Intent(ctx, BluetoothHidService::class.java).apply {
+            putExtra(BluetoothHidService.EXTRA_STATUS, status)
+        }
+        // Starting an FGS while the app is in the background throws
+        // ForegroundServiceStartNotAllowedException on Android 12+. The BT
+        // stack can fire connection callbacks at any time (e.g. host
+        // auto-reconnects after we're backgrounded), so guard against it —
+        // a missing background notification is far better than a crash.
         try {
-            reactApplicationContext.unregisterReceiver(discoveryReceiver)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                ctx.startForegroundService(intent)
+            } else {
+                ctx.startService(intent)
+            }
+        } catch (e: Exception) {
+            // Best-effort: connection still works, we just couldn't post the
+            // ongoing notification because we're not allowed to start an FGS now.
+        }
+    }
+
+    private fun stopForegroundService() {
+        try {
+            reactApplicationContext.stopService(
+                Intent(reactApplicationContext, BluetoothHidService::class.java)
+            )
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Updates the ongoing notification's text WITHOUT (re)starting the service.
+     * Called frequently during auto-type, so it must not hit FGS start paths.
+     */
+    private fun updateForegroundNotification(status: String) {
+        BluetoothHidService.updateNotification(reactApplicationContext, status)
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = reactApplicationContext.getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "conkey:autotype"
+        ).also { it.acquire(30 * 60 * 1000L) } // max 30 min
+    }
+
+    private fun releaseWakeLock() {
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        wakeLock = null
+    }
+
+    override fun invalidate() {
+        releaseWakeLock()
+        stopForegroundService()
+        if (receiverRegistered) {
+            try {
+                reactApplicationContext.unregisterReceiver(discoveryReceiver)
+            } catch (_: Exception) {}
+            receiverRegistered = false
+        }
         hidDevice?.unregisterApp()
         bluetoothAdapter?.closeProfileProxy(BluetoothProfile.HID_DEVICE, hidDevice)
         super.invalidate()

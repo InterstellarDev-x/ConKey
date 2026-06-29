@@ -15,11 +15,19 @@ export default function ConnectionScreen({ navigation }) {
   const [connectingAddress, setConnectingAddress] = useState(null);
   const listeners = useRef([]);
   const connectTimeout = useRef(null);
+  const mounted = useRef(true);
+  // Mirrors connectingAddress so the long-lived event listener (registered once)
+  // reads the current value instead of the stale one captured at setup time.
+  const connectingRef = useRef(null);
+  useEffect(() => { connectingRef.current = connectingAddress; }, [connectingAddress]);
 
   useEffect(() => {
+    mounted.current = true;
     setup();
     return () => {
+      mounted.current = false;
       listeners.current.forEach(l => l?.remove());
+      listeners.current = [];
       if (connectTimeout.current) clearTimeout(connectTimeout.current);
     };
   }, []);
@@ -27,6 +35,9 @@ export default function ConnectionScreen({ navigation }) {
   async function setup() {
     await requestPermissions();
     await BluetoothHid.initialize();
+    // The component may have unmounted during the awaits above; if so its
+    // cleanup already ran, so don't attach listeners that would leak.
+    if (!mounted.current) return;
 
     listeners.current.push(
       BluetoothHid.addListener('onHidReady', ({ ready }) => setReady(ready))
@@ -47,7 +58,12 @@ export default function ConnectionScreen({ navigation }) {
         if (state === BT_STATES.CONNECTED) {
           if (connectTimeout.current) clearTimeout(connectTimeout.current);
           setConnectingAddress(null);
-          navigation.navigate('Keyboard', { deviceName: name, deviceAddress: address });
+          // Only navigate in response to a connection the user initiated from
+          // this screen. A background auto-reconnect (no pending attempt) must
+          // not push a duplicate Keyboard screen over the current one.
+          if (connectingRef.current) {
+            navigation.navigate('Keyboard', { deviceName: name, deviceAddress: address });
+          }
         } else if (state === BT_STATES.DISCONNECTED) {
           // Only clear the spinner on an explicit disconnect; transient
           // connecting states shouldn't cancel the in-flight attempt.
@@ -63,11 +79,17 @@ export default function ConnectionScreen({ navigation }) {
   async function requestPermissions() {
     if (Platform.OS !== 'android') return;
     if (Platform.Version >= 31) {
-      await PermissionsAndroid.requestMultiple([
+      // Android 12+: BLUETOOTH_SCAN has neverForLocation so no location perm needed.
+      const perms = [
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
+      ];
+      // Android 13+: notifications are opt-in; needed for the background
+      // "connected"/typing foreground-service notification to be visible.
+      if (Platform.Version >= 33 && PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS) {
+        perms.push(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+      }
+      await PermissionsAndroid.requestMultiple(perms);
     } else {
       await PermissionsAndroid.request(
         PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
@@ -83,7 +105,12 @@ export default function ConnectionScreen({ navigation }) {
   async function startScan() {
     setDevices([]);
     setScanning(true);
-    await BluetoothHid.startScan();
+    try {
+      await BluetoothHid.startScan();
+    } catch (e) {
+      setScanning(false);
+      Alert.alert('Scan Failed', e.message || 'Could not start Bluetooth scan. Make sure Bluetooth is on and permissions are granted.');
+    }
   }
 
   async function connect(address, name) {

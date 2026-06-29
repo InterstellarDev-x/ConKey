@@ -68,7 +68,9 @@ export default function KeyboardScreen({ route, navigation }) {
 
   useEffect(() => {
     listeners.current.push(
-      BluetoothHid.addListener('onConnectionStateChanged', ({ state }) => {
+      BluetoothHid.addListener('onConnectionStateChanged', ({ address, state }) => {
+        // Ignore disconnects for other devices — only react to our own.
+        if (address && deviceAddress && address !== deviceAddress) return;
         if (state === BT_STATES.DISCONNECTED) {
           setConnected(false);
           Alert.alert('Disconnected', 'Bluetooth connection lost', [
