@@ -171,6 +171,9 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     private var wakeLock: PowerManager.WakeLock? = null
     // Guard against registering the discoveryReceiver more than once.
     private var receiverRegistered = false
+    // True while an auto-type run is in progress; lets the UI recover its
+    // "typing…" state after being backgrounded and remounted.
+    @Volatile private var autoTyping = false
 
     private val hidCallback = object : BluetoothHidDevice.Callback() {
         override fun onAppStatusChanged(pluggedDevice: BluetoothDevice?, registered: Boolean) {
@@ -449,6 +452,22 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
                 return
             }
 
+            // Already connected at the HID level? connect() would return false and
+            // NO fresh STATE_CONNECTED event would fire, leaving the UI spinning
+            // until it times out. Emit a synthetic CONNECTED so the UI proceeds.
+            val alreadyConnected = hidDevice?.connectedDevices?.any { it.address == device.address } == true
+            if (alreadyConnected) {
+                connectedDevice = device
+                startForegroundService("Connected to ${device.name ?: device.address}")
+                sendEvent("onConnectionStateChanged", Arguments.createMap().apply {
+                    putString("address", device.address)
+                    putString("name", device.name ?: "Unknown")
+                    putInt("state", BluetoothProfile.STATE_CONNECTED)
+                })
+                promise.resolve(true)
+                return
+            }
+
             val result = hidDevice?.connect(device) ?: false
             promise.resolve(result)
         } catch (e: Exception) {
@@ -462,9 +481,22 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun isAutoTyping(promise: Promise) {
+        promise.resolve(autoTyping)
+    }
+
+    @ReactMethod
     fun disconnectDevice(promise: Promise) {
         try {
-            connectedDevice?.let { hidDevice?.disconnect(it) }
+            // Stop any in-flight auto-type first so the thread doesn't keep
+            // pushing reports to a link we're tearing down.
+            stopTyping = true
+            autoTypeThread?.interrupt()
+
+            val device = resolveConnectedDevice()
+            device?.let { hidDevice?.disconnect(it) }
+            connectedDevice = null
+            stopForegroundService()
             promise.resolve(true)
         } catch (e: Exception) {
             promise.reject("DISCONNECT_ERROR", e.message)
@@ -585,6 +617,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             return
         }
         stopTyping = false
+        autoTyping = true
         autoTypeThread?.interrupt()
         autoTypeThread = Thread {
             acquireWakeLock()
@@ -642,6 +675,7 @@ class BluetoothHidModule(reactContext: ReactApplicationContext) :
             } catch (e: Exception) {
                 promise.reject("SEND_TEXT_ERROR", e.message)
             } finally {
+                autoTyping = false
                 releaseWakeLock()
             }
         }

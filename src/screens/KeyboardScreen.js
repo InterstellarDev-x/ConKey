@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
-  Vibration, ScrollView, Alert,
+  Vibration, ScrollView, Alert, BackHandler,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import BluetoothHid, { KEY, MOD, BT_STATES } from '../BluetoothHid';
@@ -65,6 +65,13 @@ export default function KeyboardScreen({ route, navigation }) {
   const [altActive, setAltActive] = useState(false);
   const [connected, setConnected] = useState(true);
   const listeners = useRef([]);
+  // Tracks whether we initiated a disconnect, so the disconnect event doesn't
+  // also pop a redundant "connection lost" alert.
+  const disconnecting = useRef(false);
+  // Mirror of `connected` for the long-lived BackHandler/listener closures,
+  // which capture state from the first render only.
+  const connectedRef = useRef(true);
+  useEffect(() => { connectedRef.current = connected; }, [connected]);
 
   useEffect(() => {
     listeners.current.push(
@@ -73,14 +80,60 @@ export default function KeyboardScreen({ route, navigation }) {
         if (address && deviceAddress && address !== deviceAddress) return;
         if (state === BT_STATES.DISCONNECTED) {
           setConnected(false);
+          if (disconnecting.current) {
+            // We asked for this — just leave quietly.
+            navigation.goBack();
+            return;
+          }
           Alert.alert('Disconnected', 'Bluetooth connection lost', [
             { text: 'OK', onPress: () => navigation.goBack() }
           ]);
         }
       })
     );
-    return () => listeners.current.forEach(l => l?.remove());
+
+    // Intercept the hardware back button: leaving the keyboard while connected
+    // must go through an explicit disconnect, not silently pop the screen.
+    // Only handle it while this screen is focused — otherwise we'd hijack the
+    // back press meant for a screen pushed on top (e.g. AutoType).
+    const backSub = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (!navigation.isFocused()) return false;
+      promptDisconnect();
+      return true; // we handle it
+    });
+
+    return () => {
+      listeners.current.forEach(l => l?.remove());
+      backSub.remove();
+    };
   }, []);
+
+  function promptDisconnect() {
+    if (!connectedRef.current) {
+      navigation.goBack();
+      return;
+    }
+    Alert.alert(
+      'Disconnect?',
+      `Disconnect from ${deviceName || 'this device'} to connect to a different one?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Disconnect',
+          style: 'destructive',
+          onPress: async () => {
+            disconnecting.current = true;
+            try {
+              await BluetoothHid.stopAutoType();
+              await BluetoothHid.disconnectDevice();
+            } catch (e) {}
+            // Fall back to leaving even if the disconnect event is slow.
+            navigation.goBack();
+          },
+        },
+      ]
+    );
+  }
 
   function buildModifier() {
     let mod = MOD.NONE;
@@ -164,13 +217,19 @@ export default function KeyboardScreen({ route, navigation }) {
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+        <TouchableOpacity onPress={promptDisconnect} style={styles.backBtn}>
           <Text style={styles.backText}>←</Text>
         </TouchableOpacity>
         <View style={styles.headerCenter}>
           <Text style={styles.deviceName} numberOfLines={1}>{deviceName}</Text>
           <View style={[styles.connDot, connected ? styles.dotGreen : styles.dotRed]} />
         </View>
+        <TouchableOpacity
+          style={styles.disconnectBtn}
+          onPress={promptDisconnect}
+        >
+          <Text style={styles.disconnectBtnText}>Disconnect</Text>
+        </TouchableOpacity>
         <TouchableOpacity
           style={styles.autoTypeBtn}
           onPress={() => navigation.navigate('AutoType', { deviceName, deviceAddress })}
@@ -207,6 +266,11 @@ const styles = StyleSheet.create({
   connDot: { width: 8, height: 8, borderRadius: 4, marginLeft: 6 },
   dotGreen: { backgroundColor: '#4CAF50' },
   dotRed: { backgroundColor: '#F44336' },
+  disconnectBtn: {
+    backgroundColor: '#c0392b', paddingHorizontal: 10,
+    paddingVertical: 6, borderRadius: 8, marginRight: 8,
+  },
+  disconnectBtnText: { color: '#fff', fontWeight: '600', fontSize: 13 },
   autoTypeBtn: {
     backgroundColor: '#6C63FF', paddingHorizontal: 12,
     paddingVertical: 6, borderRadius: 8,

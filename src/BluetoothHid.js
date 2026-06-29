@@ -23,6 +23,7 @@ export default {
   getPairedDevices: () => BluetoothHid?.getPairedDevices(),
   connectDevice: (address) => BluetoothHid?.connectDevice(address),
   isConnected: () => BluetoothHid?.isConnected(),
+  isAutoTyping: () => BluetoothHid?.isAutoTyping(),
   disconnectDevice: () => BluetoothHid?.disconnectDevice(),
   sendKey: (modifier, keyCode) => BluetoothHid?.sendKey(modifier, keyCode),
   // delayMs supports up to 5 decimals; randomness 0..1 adds human-like jitter.

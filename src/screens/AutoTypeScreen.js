@@ -20,16 +20,32 @@ const RANDOM_PRESETS = [
   { label: 'Wild', value: 0.9 },
 ];
 
+// Module-level cache so the form survives the screen being unmounted and
+// remounted (e.g. when Android recreates the activity after backgrounding).
+// React component state is lost on remount; this is not.
+const formCache = {
+  text: '',
+  delayMs: 50,
+  delayText: '50',
+  randomness: 0.5,
+};
+
 export default function AutoTypeScreen({ route, navigation }) {
   const { deviceName } = route.params || {};
-  const [text, setText] = useState('');
-  const [delayMs, setDelayMs] = useState(50);
+  const [text, setText] = useState(formCache.text);
+  const [delayMs, setDelayMs] = useState(formCache.delayMs);
   // Separate raw text so users can type partial values like "49." without snapping.
-  const [delayText, setDelayText] = useState('50');
-  const [randomness, setRandomness] = useState(0.5);
+  const [delayText, setDelayText] = useState(formCache.delayText);
+  const [randomness, setRandomness] = useState(formCache.randomness);
   const [typing, setTyping] = useState(false);
   const [progress, setProgress] = useState('');
   const progressListener = useRef(null);
+
+  // Mirror form state into the module cache so it persists across remounts.
+  useEffect(() => { formCache.text = text; }, [text]);
+  useEffect(() => { formCache.delayMs = delayMs; }, [delayMs]);
+  useEffect(() => { formCache.delayText = delayText; }, [delayText]);
+  useEffect(() => { formCache.randomness = randomness; }, [randomness]);
 
   function onDelayTextChange(raw) {
     // Keep only digits and a single decimal point, max 5 decimal places.
@@ -55,9 +71,29 @@ export default function AutoTypeScreen({ route, navigation }) {
     progressListener.current = BluetoothHid.addListener(
       'onAutoTypeProgress',
       ({ sent, total }) => {
-        if (sent < total) setProgress(`Typing… ${sent}/${total}`);
+        if (sent < total) {
+          setProgress(`Typing… ${sent}/${total}`);
+        } else {
+          // Completion (sent === total). Clear the typing flag too — on a
+          // screen recovered mid-type the original sendText() promise lives on
+          // a now-unmounted instance, so this event is the only completion signal.
+          setProgress('Done!');
+          setTyping(false);
+        }
       }
     );
+    // If we were backgrounded mid-type and the screen got recreated, the native
+    // thread is still running. Recover the "typing" UI state so the input stays
+    // disabled and the Stop button shows, instead of looking idle/cleared.
+    (async () => {
+      try {
+        const stillTyping = await BluetoothHid.isAutoTyping();
+        if (stillTyping) {
+          setTyping(true);
+          setProgress('Typing…');
+        }
+      } catch (e) {}
+    })();
     return () => progressListener.current?.remove();
   }, []);
 

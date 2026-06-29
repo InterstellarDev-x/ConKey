@@ -131,13 +131,12 @@ export default function ConnectionScreen({ navigation }) {
     }, 25000);
 
     try {
-      const started = await BluetoothHid.connectDevice(address);
-      if (!started) {
-        clearTimeout(connectTimeout.current);
-        setConnectingAddress(null);
-        Alert.alert('Connection Failed', `Could not start connection to ${name}`);
-      }
-      // Success is confirmed asynchronously via onConnectionStateChanged.
+      // NOTE: do NOT treat a falsy return as failure. BluetoothHidDevice.connect()
+      // returns false even when the link succeeds (already bonded/connected, or the
+      // request was simply queued). Success is confirmed asynchronously via
+      // onConnectionStateChanged; genuine failures arrive as a promise rejection
+      // (caught below) or are handled by the 25s timeout.
+      await BluetoothHid.connectDevice(address);
     } catch (e) {
       clearTimeout(connectTimeout.current);
       setConnectingAddress(null);
